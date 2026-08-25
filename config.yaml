@@ -1,0 +1,50 @@
+spur:
+  symmetry: 5
+  num_tiles: 96
+  num_ret_tiles: 96
+  translation_canvas: null
+  seed: null
+  rotation_canvas: 3.141592653589793
+  rotation_mask: 0.7853981633974483
+
+model:
+  d_model: 128
+  num_heads: 8
+  num_layers: 8
+  num_global_tokens: 4
+  dropout: 0.0
+
+flow:
+  matched: true
+  schedule: exponential
+  r: 2.0
+  k: 8.0
+  loss: l2
+  lsa_workers: 8
+
+train:
+  batch_size: 64
+  samples_per_epoch: 140000
+  num_epochs: 101
+  learning_rate: 0.001
+  weight_decay: 0.01
+  min_lr_factor: 0.1
+  grad_clip: 1.0
+  seed: 0
+  device: cuda
+
+reverse:
+  n: 1
+  seed: 1
+  num_iters: 1
+  time: 0.0
+
+wandb:
+  enable: true
+  project: penrose-bream
+  run_name: null
+  run_id: null
+
+output:
+  directory: outputs
+  resume: null

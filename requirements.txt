@@ -1,0 +1,6 @@
+numpy
+Pillow
+PyYAML
+scipy
+torch
+wandb
