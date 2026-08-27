@@ -25,6 +25,10 @@ from config import batches_per_epoch, config_from_dict, load_config, make_identi
 from denoiser import DirectTransformer  # noqa: E402
 from diffuser import (  # noqa: E402
     ANGLE_HALF_PERIOD,
+    MAX_LSA_GROUP_SIZE,
+    MATCH_TIME_THRESHOLD,
+    GroupedLSAMatcher,
+    available_cpu_count,
     angle_delta,
     canonicalize_xya,
     draw_time,
@@ -37,10 +41,18 @@ from evaluator import (  # noqa: E402
     build_parser,
     build_spur,
     make_generator,
+    sample_raw_flow_batch,
     sample_flow_batch,
     save_evaluation_svgs,
+    submit_evaluation_batch,
 )
 from sampler import sample  # noqa: E402
+from train import (  # noqa: E402
+    build_scheduler,
+    evaluate_transfer_baseline,
+    one_batch_lookahead,
+    validate_initialization_checkpoint,
+)
 
 
 def smoke_values(symmetry: int, output: Path, epochs: int = 1) -> dict:
@@ -64,7 +76,7 @@ def smoke_values(symmetry: int, output: Path, epochs: int = 1) -> dict:
     values["flow"].update(lsa_workers=1)
     values["train"].update(
         batch_size=2,
-        samples_per_epoch=2,
+        samples_per_epoch=4,
         num_epochs=epochs,
         device="cpu",
         seed=11,
@@ -77,7 +89,7 @@ def smoke_values(symmetry: int, output: Path, epochs: int = 1) -> dict:
 
 def check_config(root: Path) -> None:
     config = config_from_dict(smoke_values(5, root))
-    assert batches_per_epoch(config) == 1
+    assert batches_per_epoch(config) == 2
     fixed = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
     assert make_identifier(config, fixed) == "bream8_0102_0304_16x1"
     variants = smoke_values(5, root)
@@ -91,6 +103,9 @@ def check_config(root: Path) -> None:
     assert defaults.model.num_layers == 8
     assert defaults.flow.schedule == "exponential"
     assert defaults.flow.r == 2 and defaults.flow.k == 8
+    assert defaults.flow.tail_lim == 1.0 - 1.0 / 16.0
+    assert defaults.flow.lsa_workers is None
+    assert defaults.train.warmup_epochs is None
     overridden, _ = load_config(
         ["-t", "batch_size=32", "-m", "d_model=256", "-s", "sine", "-f", "loss=l1"]
     )
@@ -98,12 +113,50 @@ def check_config(root: Path) -> None:
     assert overridden.model.d_model == 256
     assert overridden.flow.schedule == "sine"
     assert overridden.flow.loss == "l1"
+    tail_cli, _ = load_config(["-s", "tail"])
+    assert tail_cli.flow.schedule == "tail"
+    tail_values = smoke_values(5, root)
+    tail_values["flow"]["schedule"] = "tail"
+    tail = config_from_dict(tail_values)
+    assert make_identifier(tail, fixed).endswith("_16x1_tail")
+    tail_values["flow"]["matched"] = False
+    assert make_identifier(config_from_dict(tail_values), fixed).endswith(
+        "_16x1_tail"
+    )
+    try:
+        invalid_tail = smoke_values(5, root)
+        invalid_tail["flow"]["tail_lim"] = 1.0
+        config_from_dict(invalid_tail)
+    except ValueError as error:
+        assert "tail_lim" in str(error)
+    else:
+        raise AssertionError("Invalid tail limit was accepted")
     try:
         load_config(["flow.unknown=1"])
     except ValueError as error:
         assert "Unknown configuration key" in str(error)
     else:
         raise AssertionError("Unknown configuration override was accepted")
+    gentle_values = smoke_values(5, root)
+    gentle_values["train"].update(
+        num_epochs=201,
+        learning_rate=1e-4,
+        warmup_epochs=40,
+        min_lr_factor=0.1,
+    )
+    gentle = config_from_dict(gentle_values)
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.SGD([parameter], lr=gentle.train.learning_rate)
+    scheduler = build_scheduler(optimizer, gentle)
+    assert abs(optimizer.param_groups[0]["lr"] - 1e-6) < 1e-15
+    for _ in range(40):
+        optimizer.step()
+        scheduler.step()
+    assert abs(optimizer.param_groups[0]["lr"] - 1e-4) < 1e-12
+    for _ in range(161):
+        optimizer.step()
+        scheduler.step()
+    assert abs(optimizer.param_groups[0]["lr"] - 1e-5) < 1e-12
 
 
 def check_schedules_and_geometry() -> None:
@@ -113,11 +166,25 @@ def check_schedules_and_geometry() -> None:
         assert time[0] == 0
         assert time[-1] == 1
         assert bool((time[1:] >= time[:-1]).all())
+    tail = schedule_time(unit, "tail", tail_lim=0.9375)
+    assert tail[0] == 0.9375
+    assert tail[-1] == 1
+    assert bool((tail[1:] >= tail[:-1]).all())
     generator = torch.Generator().manual_seed(3)
     sampled = draw_time(
         32, torch.device("cpu"), torch.float32, generator, "exponential"
     )
     assert sampled.unique().numel() > 1
+    tail_sampled = draw_time(
+        32,
+        torch.device("cpu"),
+        torch.float32,
+        generator,
+        "tail",
+        tail_lim=0.9375,
+    )
+    assert tail_sampled.unique().numel() > 1
+    assert bool((tail_sampled >= 0.9375).all())
 
     noise = torch.tensor([[[0.0, 0.0, 1.70]]])
     data = torch.tensor([[[2.0, 4.0, -1.70]]])
@@ -138,6 +205,122 @@ def check_schedules_and_geometry() -> None:
     cost = periodic_pair_cost(target, source)
     assert cost.shape == (1, 2, 2)
     assert cost[0, 0, 1] < cost[0, 0, 0]
+
+
+def check_grouped_matching() -> None:
+    identity_time = torch.tensor([MATCH_TIME_THRESHOLD, 1.0])
+    values = torch.randn(2, 12, 3, generator=torch.Generator().manual_seed(21))
+    colors = torch.tensor([[0] * 6 + [1] * 6] * 2)
+    with GroupedLSAMatcher(2) as matcher:
+        threshold = matcher.submit(
+            values, values.flip(1), colors, identity_time, matched=True
+        )
+        assert threshold.task_count == 0
+        assert torch.equal(
+            threshold.permutation(torch.device("cpu")),
+            torch.arange(12).expand(2, -1),
+        )
+        unmatched = matcher.submit(
+            values,
+            values.flip(1),
+            colors,
+            torch.zeros(2),
+            matched=False,
+        )
+        assert unmatched.task_count == 0
+        assert torch.equal(
+            unmatched.permutation(torch.device("cpu")),
+            torch.arange(12).expand(2, -1),
+        )
+
+    with GroupedLSAMatcher(2) as matcher:
+        for group_size, expected in (
+            (64, (64,)),
+            (65, (64, 1)),
+            (128, (64, 64)),
+            (256, (64, 64, 64, 64)),
+        ):
+            generator = torch.Generator().manual_seed(group_size)
+            data = torch.randn(1, group_size, 3, generator=generator)
+            noise = torch.randn(1, group_size, 3, generator=generator)
+            one_color = torch.zeros(1, group_size, dtype=torch.long)
+            handle = matcher.submit(
+                data, noise, one_color, torch.zeros(1), matched=True
+            )
+            assert handle.task_sizes == expected
+            assert all(size <= MAX_LSA_GROUP_SIZE for size in handle.task_sizes)
+            permutation = handle.permutation(torch.device("cpu"))[0]
+            assert torch.equal(
+                permutation.sort().values, torch.arange(group_size)
+            )
+            for start in range(0, group_size, MAX_LSA_GROUP_SIZE):
+                indices = torch.arange(
+                    start, min(start + MAX_LSA_GROUP_SIZE, group_size)
+                )
+                assigned = permutation[indices]
+                assert torch.equal(assigned.sort().values, indices)
+                identity_cost = periodic_pair_cost(
+                    data[:, indices], noise[:, indices]
+                ).diagonal(dim1=1, dim2=2).sum()
+                assigned_cost = periodic_pair_cost(
+                    data[:, indices], noise[:, assigned]
+                ).diagonal(dim1=1, dim2=2).sum()
+                assert assigned_cost <= identity_cost + 1e-5
+
+    data = torch.randn(1, 130, 3, generator=torch.Generator().manual_seed(31))
+    noise = data.flip(1).clone()
+    colors = torch.tensor([[0] * 65 + [1] * 65])
+    with GroupedLSAMatcher(None) as matcher:
+        handle = matcher.submit(
+            data, noise, colors, torch.zeros(1), matched=True
+        )
+        assert handle.task_sizes == (64, 1, 64, 1)
+        assert matcher.effective_workers(handle.task_count) == min(
+            available_cpu_count(), handle.task_count
+        )
+        permutation = handle.permutation(torch.device("cpu"))[0]
+        assert torch.equal(colors[0, permutation], colors[0])
+        try:
+            handle.permutation(torch.device("cpu"))
+        except RuntimeError as error:
+            assert "already been resolved" in str(error)
+        else:
+            raise AssertionError("A matching future was consumed more than once")
+
+
+def check_one_batch_lookahead() -> None:
+    events: list[str] = []
+    resolve_counts: dict[int, int] = {}
+
+    class Pending:
+        def __init__(self, value: int):
+            self.value = value
+
+        def resolve(self) -> int:
+            resolve_counts[self.value] = resolve_counts.get(self.value, 0) + 1
+            events.append(f"resolve{self.value}")
+            return self.value
+
+    def submit(value: int) -> Pending:
+        events.append(f"submit{value}")
+        return Pending(value)
+
+    for value in one_batch_lookahead(range(3), submit):
+        events.append(f"train{value}")
+
+    assert events == [
+        "submit0",
+        "resolve0",
+        "submit1",
+        "train0",
+        "resolve1",
+        "submit2",
+        "train1",
+        "resolve2",
+        "train2",
+    ]
+    assert resolve_counts == {0: 1, 1: 1, 2: 1}
+    assert list(one_batch_lookahead([], submit)) == []
 
 
 def check_losses_and_sampler(root: Path) -> None:
@@ -186,6 +369,39 @@ def check_evaluator_and_svgs(root: Path) -> None:
     ).diagonal(dim1=1, dim2=2).sum()
     assert matched_cost <= unmatched_cost
 
+    tail_values = smoke_values(6, root)
+    tail_values["flow"]["schedule"] = "tail"
+    tail_config = config_from_dict(tail_values)
+    tail_spur = build_spur(tail_config, device)
+    tail_raw = sample_raw_flow_batch(
+        tail_spur,
+        tail_config,
+        2,
+        make_generator(device, 19),
+    )
+    assert tail_raw.schedule == "tail"
+    with GroupedLSAMatcher(1) as matcher:
+        tail_pending = submit_evaluation_batch(
+            tail_raw, tail_config, matcher, matched=True
+        )
+        assert tail_pending.flow.handle.task_count == 0
+        tail_batch = tail_pending.resolve()
+    assert torch.equal(tail_batch.flow.noise, tail_raw.noise)
+    override_raw = sample_raw_flow_batch(
+        spur,
+        config,
+        2,
+        make_generator(device, 23),
+        schedule="tail",
+    )
+    with GroupedLSAMatcher(1) as matcher:
+        override_pending = submit_evaluation_batch(
+            override_raw, config, matcher, matched=True
+        )
+        assert override_pending.flow.handle.task_count == 0
+        override_batch = override_pending.resolve()
+    assert torch.equal(override_batch.flow.noise, override_raw.noise)
+
     model = DirectTransformer(config.model)
     outputs = sample(model, matched.flow.state[:1], matched.colors[:1], 3)
     class_name = spur.class_names[int(matched.labels[0].item())]
@@ -216,6 +432,10 @@ def check_evaluator_and_svgs(root: Path) -> None:
         pass
     else:
         raise AssertionError("Evaluator accepted both exact time and a schedule")
+    assert (
+        parser.parse_args(["checkpoint.pt", "-s", "tail", "-o", "x"]).time_schedule
+        == "tail"
+    )
 
 
 def check_retention(root: Path) -> None:
@@ -230,7 +450,7 @@ def check_retention(root: Path) -> None:
     }
 
 
-def run_command(arguments: list[str], environment: dict[str, str]) -> None:
+def run_command(arguments: list[str], environment: dict[str, str]) -> str:
     result = subprocess.run(
         [sys.executable, "-u", "train.py", *arguments],
         cwd=PROJECT_DIR,
@@ -243,6 +463,7 @@ def run_command(arguments: list[str], environment: dict[str, str]) -> None:
         raise AssertionError(
             f"Fresh-process command failed ({result.returncode}):\n{result.stdout}"
         )
+    return result.stdout
 
 
 def run_evaluator(
@@ -299,8 +520,12 @@ def check_fresh_process_resume(root: Path) -> None:
     run_command(["--config", str(config_path)], environment)
     first_path, first = newest_checkpoint(output)
     assert first["epoch"] == 0
-    assert first["global_step"] == 1
+    assert first["global_step"] == 2
     assert first["flow"]["schedule"] == "exponential"
+    assert first["flow"]["tail_lim"] == 0.9375
+    assert first["flow"]["effective_matched"] is True
+    assert first["flow"]["match_time_threshold"] == MATCH_TIME_THRESHOLD
+    assert first["flow"]["lsa_group_size"] == MAX_LSA_GROUP_SIZE
     assert first["identifier"].startswith("bream8_")
     svg_directory = Path(first["output_directory"]) / "svg"
     svg_050 = svg_directory / f"{first['identifier']}_e000_t050.svg"
@@ -317,7 +542,7 @@ def check_fresh_process_resume(root: Path) -> None:
     run_command(["--resume", str(first_path), "-t", "num_epochs=2"], environment)
     newest_path, resumed = newest_checkpoint(output)
     assert resumed["epoch"] == 1
-    assert resumed["global_step"] == 2
+    assert resumed["global_step"] == 4
     assert resumed["identifier"] == first["identifier"]
     assert resumed["output_directory"] == first["output_directory"]
     assert (svg_directory / f"{first['identifier']}_e001_t050.svg").exists()
@@ -325,15 +550,134 @@ def check_fresh_process_resume(root: Path) -> None:
     assert 1 <= len(list(newest_path.parent.glob("*.pt"))) <= 2
 
 
+def check_weight_transfer(root: Path) -> None:
+    environment = os.environ.copy()
+    environment["PENROSE_SPUR_PATH"] = str(PROJECT_DIR.parent / "PenroseSpur")
+    source_output = root / "source"
+    source_config = root / "source.yaml"
+    write_config(source_config, smoke_values(6, source_output, epochs=1))
+    run_command(["--config", str(source_config)], environment)
+    source_path, source = newest_checkpoint(source_output)
+
+    legacy = copy.deepcopy(source)
+    legacy["config"].pop("flow")
+    legacy["config"]["corruption"] = {"alpha": None}
+    legacy["epoch"] = 1000
+    legacy["global_step"] = 12345
+    legacy_path = root / "legacy-e1000.pt"
+    torch.save(legacy, legacy_path)
+
+    target_output = root / "target"
+    target_values = smoke_values(6, target_output, epochs=1)
+    target_values["spur"].update(num_tiles=10, num_ret_tiles=10)
+    target_values["flow"].update(schedule="tail", tail_lim=0.97)
+    target_values["train"].update(
+        learning_rate=1e-4,
+        warmup_epochs=0,
+        weight_decay=1e-3,
+    )
+    target_config = root / "target.yaml"
+    write_config(target_config, target_values)
+    stdout = run_command(
+        [
+            "--init-weights",
+            str(legacy_path),
+            "--config",
+            str(target_config),
+        ],
+        environment,
+    )
+    assert "Transfer baseline loss=" in stdout
+    _, transferred = newest_checkpoint(target_output)
+    assert transferred["epoch"] == 0
+    assert transferred["global_step"] == 2
+    assert transferred["identifier"] != source["identifier"]
+    assert transferred["initialization"] == {
+        "mode": "weights_only",
+        "source_checkpoint": str(legacy_path),
+        "source_identifier": source["identifier"],
+        "source_epoch": 1000,
+        "source_global_step": 12345,
+        "source_symmetry": 6,
+        "source_num_tiles": 8,
+        "source_schedule": "legacy_corruption",
+        "target_num_tiles": 10,
+        "target_schedule": "tail",
+        "target_tail_lim": 0.97,
+    }
+    assert transferred["transfer_baseline"]["average_time"] >= 0.97
+    assert transferred["config"]["train"]["learning_rate"] == 1e-4
+    assert transferred["config"]["train"]["weight_decay"] == 1e-3
+
+    target_config_object = config_from_dict(target_values)
+    incompatible = copy.deepcopy(legacy)
+    incompatible["config"]["model"]["num_layers"] = 2
+    try:
+        validate_initialization_checkpoint(target_config_object, incompatible)
+    except ValueError as error:
+        assert "model.num_layers" in str(error)
+    else:
+        raise AssertionError("Mismatched transfer architecture was accepted")
+    incompatible = copy.deepcopy(legacy)
+    incompatible["config"]["spur"]["symmetry"] = 5
+    try:
+        validate_initialization_checkpoint(target_config_object, incompatible)
+    except ValueError as error:
+        assert "symmetry" in str(error)
+    else:
+        raise AssertionError("Mismatched transfer symmetry was accepted")
+
+    try:
+        with redirect_stderr(io.StringIO()):
+            load_config(
+                [
+                    "--resume",
+                    str(source_path),
+                    "--init-weights",
+                    str(legacy_path),
+                ]
+            )
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("CLI accepted resume and init-weights together")
+
+    baseline_config = config_from_dict(smoke_values(6, root / "baseline"))
+    spur = build_spur(baseline_config, torch.device("cpu"))
+    model = DirectTransformer(baseline_config.model)
+    before = {
+        key: value.detach().clone() for key, value in model.state_dict().items()
+    }
+    matcher = GroupedLSAMatcher(1)
+    try:
+        metrics = evaluate_transfer_baseline(
+            model,
+            spur,
+            baseline_config,
+            matcher,
+            make_generator(torch.device("cpu"), 99),
+        )
+    finally:
+        matcher.shutdown()
+    assert metrics["loss"] >= 0
+    assert all(
+        torch.equal(before[key], value)
+        for key, value in model.state_dict().items()
+    )
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="penrose-bream-flow-smoke-") as temporary:
         root = Path(temporary)
         check_config(root / "config")
         check_schedules_and_geometry()
+        check_grouped_matching()
+        check_one_batch_lookahead()
         check_losses_and_sampler(root / "loss")
         check_evaluator_and_svgs(root / "evaluation")
         check_retention(root / "retention")
         check_fresh_process_resume(root / "resume")
+        check_weight_transfer(root / "transfer")
     print("PenroseBream flow smoke test passed")
 
 

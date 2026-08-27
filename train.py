@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 from pathlib import Path
 import random
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 
 import numpy as np
 import torch
@@ -22,17 +23,40 @@ from config import (
     validate_resume_config,
 )
 from denoiser import DirectTransformer
-from diffuser import endpoint_loss, flow_state
+from diffuser import (
+    MAX_LSA_GROUP_SIZE,
+    MATCH_TIME_THRESHOLD,
+    GroupedLSAMatcher,
+    endpoint_loss,
+)
 from evaluator import (
     build_spur,
     choose_device,
     lattice_loss,
     make_generator,
-    sample_flow_batch,
+    sample_raw_flow_batch,
     save_comparison_svg,
     shared_viewbox,
+    submit_evaluation_batch,
 )
 from sampler import sample
+
+
+def one_batch_lookahead(
+    raw_batches: Iterable[Any],
+    submit: Callable[[Any], Any],
+) -> Iterator[Any]:
+    """Resolve the first batch, then submit each successor before yielding."""
+    iterator = iter(raw_batches)
+    try:
+        current = submit(next(iterator)).resolve()
+    except StopIteration:
+        return
+    for raw in iterator:
+        pending = submit(raw)
+        yield current
+        current = pending.resolve()
+    yield current
 
 
 def seed_everything(seed: int) -> None:
@@ -45,7 +69,9 @@ def seed_everything(seed: int) -> None:
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: Config) -> LambdaLR:
     epochs = config.train.num_epochs
-    warmup = min(10, math.floor(0.05 * epochs))
+    warmup = config.train.warmup_epochs
+    if warmup is None:
+        warmup = min(10, math.floor(0.05 * epochs))
     floor = config.train.min_lr_factor
 
     def factor(position: int) -> float:
@@ -59,6 +85,86 @@ def build_scheduler(optimizer: torch.optim.Optimizer, config: Config) -> LambdaL
         return floor
 
     return LambdaLR(optimizer, lr_lambda=factor)
+
+
+def validate_initialization_checkpoint(
+    config: Config, checkpoint: dict[str, Any]
+) -> None:
+    """Require compatible weights while allowing a new tile count and objective."""
+    saved = checkpoint.get("config")
+    if not isinstance(saved, dict):
+        raise ValueError("Initialization checkpoint has no configuration mapping")
+    saved_model = saved.get("model")
+    if not isinstance(saved_model, dict):
+        raise ValueError("Initialization checkpoint has no model configuration")
+    current_model = config.to_dict()["model"]
+    model_keys = (
+        "d_model",
+        "num_heads",
+        "num_layers",
+        "num_global_tokens",
+        "dropout",
+    )
+    changed = [
+        key
+        for key in model_keys
+        if saved_model.get(key) != current_model[key]
+    ]
+    if changed:
+        details = ", ".join(
+            f"model.{key}: checkpoint={saved_model.get(key)!r}, "
+            f"current={current_model[key]!r}"
+            for key in changed
+        )
+        raise ValueError(f"Incompatible initialization architecture: {details}")
+    saved_spur = saved.get("spur")
+    saved_symmetry = (
+        saved_spur.get("symmetry") if isinstance(saved_spur, dict) else None
+    )
+    if saved_symmetry != config.spur.symmetry:
+        raise ValueError(
+            "Incompatible initialization symmetry: "
+            f"checkpoint={saved_symmetry!r}, current={config.spur.symmetry!r}"
+        )
+    if not isinstance(checkpoint.get("model"), dict):
+        raise ValueError("Initialization checkpoint has no model state")
+
+
+def evaluate_transfer_baseline(
+    model: DirectTransformer,
+    spur: Any,
+    config: Config,
+    matcher: GroupedLSAMatcher,
+    generator: torch.Generator,
+) -> dict[str, float]:
+    """Evaluate initialized weights on one target-task batch without updates."""
+    model.eval()
+    with torch.inference_mode():
+        raw = sample_raw_flow_batch(
+            spur,
+            config,
+            config.train.batch_size,
+            generator,
+        )
+        prepared = submit_evaluation_batch(raw, config, matcher).resolve()
+        prediction = model(prepared.flow.state, prepared.colors)
+        terms = endpoint_loss(prediction, prepared.flow.data, config.flow.loss)
+        produced = sample(model, prepared.flow.state, prepared.colors, 1)[0]
+        baseline = {
+            "loss": float(terms.total.item()),
+            "xy_loss": float(terms.xy.item()),
+            "scaled_angle_loss": float(terms.angle.item()),
+            "lattice_loss": float(
+                lattice_loss(
+                    config.spur.symmetry,
+                    spur.side,
+                    produced,
+                    prepared.colors,
+                ).item()
+            ),
+            "average_time": float(prepared.flow.time.mean().item()),
+        }
+    return baseline
 
 
 class WandbLogger:
@@ -101,12 +207,17 @@ class WandbLogger:
         if self.run is not None:
             self.run.log(metrics, step=epoch)
 
+    def log_transfer_baseline(self, metrics: dict[str, float]) -> None:
+        if self.run is not None:
+            for key, value in metrics.items():
+                self.run.summary[f"transfer_baseline/{key}"] = value
+
     def finish(self) -> None:
         if self.run is not None:
             self.run.finish()
 
 
-def train(config: Config) -> Path | None:
+def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
     seed_everything(config.train.seed)
     device = choose_device(config.train.device)
     resume_path = Path(config.output.resume) if config.output.resume else None
@@ -115,8 +226,15 @@ def train(config: Config) -> Path | None:
         if resume_path
         else None
     )
+    initialization = (
+        torch.load(init_weights_path, map_location="cpu", weights_only=False)
+        if init_weights_path
+        else None
+    )
     if resume:
         validate_resume_config(config, resume["config"])
+    if initialization:
+        validate_initialization_checkpoint(config, initialization)
 
     spur = build_spur(config, device)
     model = DirectTransformer(config.model).to(device)
@@ -146,6 +264,38 @@ def train(config: Config) -> Path | None:
         wandb_run_id = resume.get("wandb_run_id")
         best_epoch = int(resume["best_epoch"])
         best_loss = float(resume["best_primary_metric"])
+        initialization_metadata = resume.get("initialization")
+        transfer_baseline = resume.get("transfer_baseline")
+    elif initialization:
+        model.load_state_dict(initialization["model"], strict=True)
+        start_epoch = 0
+        global_step = 0
+        identifier = make_identifier(config)
+        output_directory = Path(config.output.directory) / identifier
+        run_name = config.wandb.run_name or identifier
+        wandb_run_id = config.wandb.run_id or identifier
+        best_epoch = -1
+        best_loss = math.inf
+        saved_config = initialization["config"]
+        source_flow = saved_config.get("flow")
+        initialization_metadata = {
+            "mode": "weights_only",
+            "source_checkpoint": str(init_weights_path),
+            "source_identifier": str(initialization.get("identifier", "")),
+            "source_epoch": int(initialization.get("epoch", -1)),
+            "source_global_step": int(initialization.get("global_step", 0)),
+            "source_symmetry": int(saved_config["spur"]["symmetry"]),
+            "source_num_tiles": int(saved_config["spur"]["num_tiles"]),
+            "source_schedule": (
+                source_flow.get("schedule")
+                if isinstance(source_flow, dict)
+                else "legacy_corruption"
+            ),
+            "target_num_tiles": config.spur.num_tiles,
+            "target_schedule": config.flow.schedule,
+            "target_tail_lim": config.flow.tail_lim,
+        }
+        transfer_baseline = None
     else:
         start_epoch = 0
         global_step = 0
@@ -155,6 +305,8 @@ def train(config: Config) -> Path | None:
         wandb_run_id = config.wandb.run_id or identifier
         best_epoch = -1
         best_loss = math.inf
+        initialization_metadata = None
+        transfer_baseline = None
 
     checkpoint_directory = output_directory / "checkpoints"
     svg_directory = output_directory / "svg"
@@ -180,7 +332,24 @@ def train(config: Config) -> Path | None:
     print(f"Samples per epoch: {actual_samples} ({steps} batches)")
 
     last_checkpoint: Path | None = resume_path
+    matcher = GroupedLSAMatcher(config.flow.lsa_workers)
     try:
+        if initialization:
+            baseline_generator = make_generator(
+                device, config.reverse.seed + 1_000_003
+            )
+            transfer_baseline = evaluate_transfer_baseline(
+                model, spur, config, matcher, baseline_generator
+            )
+            logger.log_transfer_baseline(transfer_baseline)
+            print(
+                "Transfer baseline "
+                f"loss={transfer_baseline['loss']:.6f} "
+                f"xy={transfer_baseline['xy_loss']:.6f} "
+                f"angle={transfer_baseline['scaled_angle_loss']:.6f} "
+                f"t={transfer_baseline['average_time']:.6f} "
+                f"lattice={transfer_baseline['lattice_loss']:.6f}"
+            )
         for epoch in range(start_epoch, config.train.num_epochs):
             model.train()
             loss_sum = 0.0
@@ -188,16 +357,22 @@ def train(config: Config) -> Path | None:
             angle_sum = 0.0
             gradient_norm_sum = 0.0
             time_sum = 0.0
-            for _ in range(steps):
-                prepared = sample_flow_batch(
+            raw_batches = (
+                sample_raw_flow_batch(
                     spur,
                     config,
                     config.train.batch_size,
                     training_generator,
                 )
-                prediction = model(prepared.flow.state, prepared.colors)
+                for _ in range(steps)
+            )
+            for current in one_batch_lookahead(
+                raw_batches,
+                lambda raw: submit_evaluation_batch(raw, config, matcher),
+            ):
+                prediction = model(current.flow.state, current.colors)
                 terms = endpoint_loss(
-                    prediction, prepared.flow.data, config.flow.loss
+                    prediction, current.flow.data, config.flow.loss
                 )
 
                 optimizer.zero_grad(set_to_none=True)
@@ -211,7 +386,7 @@ def train(config: Config) -> Path | None:
                 xy_sum += terms.xy.detach().item()
                 angle_sum += terms.angle.detach().item()
                 gradient_norm_sum += gradient_norm.detach().item()
-                time_sum += prepared.flow.time.mean().item()
+                time_sum += current.flow.time.mean().item()
 
             scheduler.step()
             metrics = {
@@ -227,32 +402,43 @@ def train(config: Config) -> Path | None:
                 best_loss = metrics["average_training_loss"]
                 best_epoch = epoch
 
-            epoch_pair = sample_flow_batch(
+            epoch_raw = sample_raw_flow_batch(
                 spur,
                 config,
                 1,
                 sampling_generator,
                 time=0.5,
             )
-            state_050 = epoch_pair.flow.state
-            state_095 = flow_state(
-                epoch_pair.flow.noise,
-                epoch_pair.flow.data,
-                torch.full_like(epoch_pair.flow.time, 0.95),
-            )
-            produced_050 = sample(model, state_050, epoch_pair.colors, 1)[0]
-            produced_095 = sample(model, state_095, epoch_pair.colors, 1)[0]
+            epoch_pair_050 = submit_evaluation_batch(
+                epoch_raw, config, matcher
+            ).resolve()
+            epoch_pair_095 = submit_evaluation_batch(
+                replace(
+                    epoch_raw,
+                    time=torch.full_like(epoch_raw.time, MATCH_TIME_THRESHOLD),
+                ),
+                config,
+                matcher,
+            ).resolve()
+            state_050 = epoch_pair_050.flow.state
+            state_095 = epoch_pair_095.flow.state
+            produced_050 = sample(
+                model, state_050, epoch_pair_050.colors, 1
+            )[0]
+            produced_095 = sample(
+                model, state_095, epoch_pair_095.colors, 1
+            )[0]
             metrics["lattice_loss_t050"] = lattice_loss(
                 config.spur.symmetry,
                 spur.side,
                 produced_050,
-                epoch_pair.colors,
+                epoch_pair_050.colors,
             ).item()
             metrics["lattice_loss_t095"] = lattice_loss(
                 config.spur.symmetry,
                 spur.side,
                 produced_095,
-                epoch_pair.colors,
+                epoch_pair_095.colors,
             ).item()
             checkpoint_id = f"{identifier}_e{epoch:03d}"
             epoch_viewbox = shared_viewbox(
@@ -262,7 +448,7 @@ def train(config: Config) -> Path | None:
                     state_095[0],
                     produced_095[0],
                 ],
-                epoch_pair.colors[0],
+                epoch_pair_050.colors[0],
                 config.spur.symmetry,
                 spur.side,
             )
@@ -270,7 +456,7 @@ def train(config: Config) -> Path | None:
                 svg_directory / f"{checkpoint_id}_t050.svg",
                 state_050[0],
                 produced_050[0],
-                epoch_pair.colors[0],
+                epoch_pair_050.colors[0],
                 config.spur.symmetry,
                 spur.side,
                 epoch_viewbox,
@@ -279,7 +465,7 @@ def train(config: Config) -> Path | None:
                 svg_directory / f"{checkpoint_id}_t095.svg",
                 state_095[0],
                 produced_095[0],
-                epoch_pair.colors[0],
+                epoch_pair_095.colors[0],
                 config.spur.symmetry,
                 spur.side,
                 epoch_viewbox,
@@ -309,10 +495,18 @@ def train(config: Config) -> Path | None:
                     "schedule": config.flow.schedule,
                     "r": config.flow.r,
                     "k": config.flow.k,
+                    "tail_lim": config.flow.tail_lim,
+                    "effective_matched": (
+                        config.flow.matched and config.flow.schedule != "tail"
+                    ),
                     "loss": config.flow.loss,
+                    "match_time_threshold": MATCH_TIME_THRESHOLD,
+                    "lsa_group_size": MAX_LSA_GROUP_SIZE,
                 },
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
+                "initialization": initialization_metadata,
+                "transfer_baseline": transfer_baseline,
                 "config": config.to_dict(),
                 "symmetry": config.spur.symmetry,
                 "side": spur.side,
@@ -333,13 +527,14 @@ def train(config: Config) -> Path | None:
                 checkpoint_directory, identifier, epoch, best_epoch
             )
     finally:
+        matcher.shutdown()
         logger.finish()
     return last_checkpoint
 
 
 def main() -> None:
-    config, _ = load_config()
-    train(config)
+    config, args = load_config()
+    train(config, init_weights_path=args.init_weights)
 
 
 if __name__ == "__main__":

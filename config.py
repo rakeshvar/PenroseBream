@@ -44,8 +44,9 @@ class FlowConfig:
     schedule: str = "exponential"
     r: float = 2.0
     k: float = 8.0
+    tail_lim: float = 0.9375
     loss: str = "l2"
-    lsa_workers: int = 8
+    lsa_workers: int | None = None
 
 
 @dataclass
@@ -54,6 +55,7 @@ class TrainConfig:
     samples_per_epoch: int = 140_000
     num_epochs: int = 101
     learning_rate: float = 1e-3
+    warmup_epochs: int | None = None
     weight_decay: float = 0.01
     min_lr_factor: float = 0.1
     grad_clip: float = 1.0
@@ -124,11 +126,13 @@ IMMUTABLE_ON_RESUME = (
     "flow.schedule",
     "flow.r",
     "flow.k",
+    "flow.tail_lim",
     "flow.loss",
     "flow.lsa_workers",
     "train.batch_size",
     "train.samples_per_epoch",
     "train.learning_rate",
+    "train.warmup_epochs",
     "train.weight_decay",
     "train.min_lr_factor",
     "train.grad_clip",
@@ -211,14 +215,24 @@ def validate(config: Config) -> None:
         raise ValueError("model layer and global-token counts must be positive")
     if not 0.0 <= config.model.dropout < 1.0:
         raise ValueError("model.dropout must be in [0,1)")
-    if config.flow.schedule not in ("uniform", "exponential", "sine", "quadratic"):
-        raise ValueError("flow.schedule must be uniform, exponential, sine, or quadratic")
+    if config.flow.schedule not in (
+        "uniform",
+        "exponential",
+        "sine",
+        "quadratic",
+        "tail",
+    ):
+        raise ValueError(
+            "flow.schedule must be uniform, exponential, sine, quadratic, or tail"
+        )
     if config.flow.loss not in ("l1", "l2"):
         raise ValueError("flow.loss must be l1 or l2")
     if config.flow.r <= 1 or config.flow.k <= 0:
         raise ValueError("flow.r must exceed 1 and flow.k must be positive")
-    if config.flow.lsa_workers <= 0:
-        raise ValueError("flow.lsa_workers must be positive")
+    if not 0.0 <= config.flow.tail_lim < 1.0:
+        raise ValueError("flow.tail_lim must be in [0,1)")
+    if config.flow.lsa_workers is not None and config.flow.lsa_workers <= 0:
+        raise ValueError("flow.lsa_workers must be positive or null")
     if min(
         config.train.batch_size,
         config.train.samples_per_epoch,
@@ -229,6 +243,12 @@ def validate(config: Config) -> None:
         raise ValueError("all count settings must be positive")
     if config.train.learning_rate <= 0 or config.train.grad_clip <= 0:
         raise ValueError("learning rate and gradient clip must be positive")
+    if config.train.warmup_epochs is not None and not (
+        0 <= config.train.warmup_epochs < config.train.num_epochs
+    ):
+        raise ValueError("train.warmup_epochs must be in [0, num_epochs)")
+    if config.train.weight_decay < 0:
+        raise ValueError("train.weight_decay must be nonnegative")
     if not 0.0 < config.train.min_lr_factor <= 1.0:
         raise ValueError("train.min_lr_factor must be in (0,1]")
     if not 0.0 <= config.reverse.time <= 1.0:
@@ -251,7 +271,7 @@ def make_identifier(config: Config, now: datetime | None = None) -> str:
         f"bream{config.spur.num_ret_tiles}_{now:%m%d}_{now:%H%M}_"
         f"{config.model.d_model}x{config.model.num_layers}"
     )
-    if not config.flow.matched:
+    if config.flow.schedule != "tail" and not config.flow.matched:
         identifier += "_um"
     if config.flow.loss == "l1":
         identifier += "_l1"
@@ -269,6 +289,8 @@ def nested_value(mapping: dict[str, Any], dotted: str) -> Any:
 
 def validate_resume_config(config: Config, saved: dict[str, Any]) -> None:
     current = config.to_dict()
+    saved = copy.deepcopy(saved)
+    saved.setdefault("train", {}).setdefault("warmup_epochs", None)
     changed = [
         key
         for key in IMMUTABLE_ON_RESUME
@@ -293,7 +315,13 @@ def _append_overrides(
 def load_config(argv: list[str] | None = None) -> tuple[Config, argparse.Namespace]:
     parser = argparse.ArgumentParser(description="Train PenroseBream")
     parser.add_argument("--config", type=Path, help="Optional experiment YAML")
-    parser.add_argument("--resume", type=Path, help="Checkpoint to resume")
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume", type=Path, help="Checkpoint to resume")
+    initialization.add_argument(
+        "--init-weights",
+        type=Path,
+        help="Load model weights while resetting all optimization state",
+    )
     parser.add_argument("--symmetry", type=int)
     parser.add_argument("--num-tiles", type=int)
     parser.add_argument("--translation", type=float)
@@ -306,7 +334,7 @@ def load_config(argv: list[str] | None = None) -> tuple[Config, argparse.Namespa
     parser.add_argument(
         "-s",
         "--time-schedule",
-        choices=("uniform", "exponential", "sine", "quadratic"),
+        choices=("uniform", "exponential", "sine", "quadratic", "tail"),
     )
     parser.add_argument("--wandb-project")
     parser.add_argument("--wandb-name")

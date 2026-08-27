@@ -19,14 +19,16 @@ flow:
   schedule: exponential
   r: 2.0
   k: 8.0
+  tail_lim: 0.9375
   loss: l2
-  lsa_workers: 8
+  lsa_workers: null
 
 train:
   batch_size: 64
   samples_per_epoch: 140000
   num_epochs: 101
   learning_rate: 0.001
+  warmup_epochs: null
   weight_decay: 0.01
   min_lr_factor: 0.1
   grad_clip: 1.0
