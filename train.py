@@ -28,6 +28,7 @@ from diffuser import (
     MATCH_TIME_THRESHOLD,
     GroupedLSAMatcher,
     endpoint_loss,
+    jitter_lower_limits,
 )
 from evaluator import (
     build_spur,
@@ -163,6 +164,8 @@ def evaluate_transfer_baseline(
                 ).item()
             ),
             "average_time": float(prepared.flow.time.mean().item()),
+            "average_xy_time": float(prepared.flow.time_xy.mean().item()),
+            "average_angle_time": float(prepared.flow.time_angle.mean().item()),
         }
     return baseline
 
@@ -237,6 +240,16 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
         validate_initialization_checkpoint(config, initialization)
 
     spur = build_spur(config, device)
+    jitter_limits = (
+        jitter_lower_limits(
+            config.spur.symmetry,
+            spur.side,
+            config.flow.jitter_xy,
+            config.flow.jitter_angle,
+        )
+        if config.flow.schedule is None
+        else None
+    )
     model = DirectTransformer(config.model).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -287,13 +300,15 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
             "source_symmetry": int(saved_config["spur"]["symmetry"]),
             "source_num_tiles": int(saved_config["spur"]["num_tiles"]),
             "source_schedule": (
-                source_flow.get("schedule")
+                source_flow.get("schedule") or "jitter"
                 if isinstance(source_flow, dict)
                 else "legacy_corruption"
             ),
             "target_num_tiles": config.spur.num_tiles,
             "target_schedule": config.flow.schedule,
             "target_tail_lim": config.flow.tail_lim,
+            "target_jitter_xy": config.flow.jitter_xy,
+            "target_jitter_angle": config.flow.jitter_angle,
         }
         transfer_baseline = None
     else:
@@ -330,6 +345,12 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
     print(f"Identifier: {identifier}")
     print(f"Output: {output_directory}")
     print(f"Samples per epoch: {actual_samples} ({steps} batches)")
+    if jitter_limits is not None:
+        print(
+            "Jitter sampling "
+            f"J_xy={config.flow.jitter_xy:g} J_angle={config.flow.jitter_angle:g} "
+            f"tau_xy={jitter_limits[0]:.6f} tau_angle={jitter_limits[1]:.6f}"
+        )
 
     last_checkpoint: Path | None = resume_path
     matcher = GroupedLSAMatcher(config.flow.lsa_workers)
@@ -357,6 +378,8 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
             angle_sum = 0.0
             gradient_norm_sum = 0.0
             time_sum = 0.0
+            xy_time_sum = 0.0
+            angle_time_sum = 0.0
             raw_batches = (
                 sample_raw_flow_batch(
                     spur,
@@ -387,6 +410,8 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
                 angle_sum += terms.angle.detach().item()
                 gradient_norm_sum += gradient_norm.detach().item()
                 time_sum += current.flow.time.mean().item()
+                xy_time_sum += current.flow.time_xy.mean().item()
+                angle_time_sum += current.flow.time_angle.mean().item()
 
             scheduler.step()
             metrics = {
@@ -397,6 +422,10 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "average_time": time_sum / steps,
                 "average_noise_fraction": 1.0 - time_sum / steps,
+                "average_xy_time": xy_time_sum / steps,
+                "average_angle_time": angle_time_sum / steps,
+                "average_xy_noise_fraction": 1.0 - xy_time_sum / steps,
+                "average_angle_noise_fraction": 1.0 - angle_time_sum / steps,
             }
             if metrics["average_training_loss"] < best_loss:
                 best_loss = metrics["average_training_loss"]
@@ -416,6 +445,12 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
                 replace(
                     epoch_raw,
                     time=torch.full_like(epoch_raw.time, MATCH_TIME_THRESHOLD),
+                    time_xy=torch.full_like(
+                        epoch_raw.time_xy, MATCH_TIME_THRESHOLD
+                    ),
+                    time_angle=torch.full_like(
+                        epoch_raw.time_angle, MATCH_TIME_THRESHOLD
+                    ),
                 ),
                 config,
                 matcher,
@@ -475,7 +510,8 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
                 f"Epoch {epoch:03d} loss={metrics['average_training_loss']:.6f} "
                 f"xy={metrics['xy_loss']:.6f} "
                 f"angle={metrics['scaled_angle_loss']:.6f} "
-                f"t={metrics['average_time']:.6f} "
+                f"t_xy={metrics['average_xy_time']:.6f} "
+                f"t_angle={metrics['average_angle_time']:.6f} "
                 f"lattice050={metrics['lattice_loss_t050']:.6f} "
                 f"lattice095={metrics['lattice_loss_t095']:.6f} "
                 f"grad={metrics['gradient_norm']:.6f} "
@@ -493,11 +529,20 @@ def train(config: Config, init_weights_path: Path | None = None) -> Path | None:
                 "flow": {
                     "matched": config.flow.matched,
                     "schedule": config.flow.schedule,
+                    "jitter_xy": config.flow.jitter_xy,
+                    "jitter_angle": config.flow.jitter_angle,
+                    "jitter_lower_xy": (
+                        jitter_limits[0] if jitter_limits is not None else None
+                    ),
+                    "jitter_lower_angle": (
+                        jitter_limits[1] if jitter_limits is not None else None
+                    ),
                     "r": config.flow.r,
                     "k": config.flow.k,
                     "tail_lim": config.flow.tail_lim,
                     "effective_matched": (
-                        config.flow.matched and config.flow.schedule != "tail"
+                        config.flow.matched
+                        and config.flow.schedule not in (None, "tail")
                     ),
                     "loss": config.flow.loss,
                     "match_time_threshold": MATCH_TIME_THRESHOLD,

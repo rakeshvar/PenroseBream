@@ -41,7 +41,9 @@ class ModelConfig:
 @dataclass
 class FlowConfig:
     matched: bool = True
-    schedule: str = "exponential"
+    schedule: str | None = None
+    jitter_xy: float = 1.0
+    jitter_angle: float = 1.0
     r: float = 2.0
     k: float = 8.0
     tail_lim: float = 0.9375
@@ -124,6 +126,8 @@ IMMUTABLE_ON_RESUME = (
     "model.dropout",
     "flow.matched",
     "flow.schedule",
+    "flow.jitter_xy",
+    "flow.jitter_angle",
     "flow.r",
     "flow.k",
     "flow.tail_lim",
@@ -216,6 +220,7 @@ def validate(config: Config) -> None:
     if not 0.0 <= config.model.dropout < 1.0:
         raise ValueError("model.dropout must be in [0,1)")
     if config.flow.schedule not in (
+        None,
         "uniform",
         "exponential",
         "sine",
@@ -223,8 +228,10 @@ def validate(config: Config) -> None:
         "tail",
     ):
         raise ValueError(
-            "flow.schedule must be uniform, exponential, sine, quadratic, or tail"
+            "flow.schedule must be null, uniform, exponential, sine, quadratic, or tail"
         )
+    if config.flow.jitter_xy <= 0 or config.flow.jitter_angle <= 0:
+        raise ValueError("flow jitter targets must be positive")
     if config.flow.loss not in ("l1", "l2"):
         raise ValueError("flow.loss must be l1 or l2")
     if config.flow.r <= 1 or config.flow.k <= 0:
@@ -275,7 +282,14 @@ def make_identifier(config: Config, now: datetime | None = None) -> str:
         identifier += "_um"
     if config.flow.loss == "l1":
         identifier += "_l1"
-    if config.flow.schedule != "exponential":
+    if config.flow.schedule is None:
+        def compact(value: float) -> str:
+            return f"{value:g}".replace(".", "p")
+
+        identifier += f"_j{compact(config.flow.jitter_xy)}"
+        if config.flow.jitter_angle != config.flow.jitter_xy:
+            identifier += f"x{compact(config.flow.jitter_angle)}"
+    elif config.flow.schedule != "exponential":
         identifier += f"_{config.flow.schedule}"
     return identifier
 
@@ -291,6 +305,8 @@ def validate_resume_config(config: Config, saved: dict[str, Any]) -> None:
     current = config.to_dict()
     saved = copy.deepcopy(saved)
     saved.setdefault("train", {}).setdefault("warmup_epochs", None)
+    saved.setdefault("flow", {}).setdefault("jitter_xy", 1.0)
+    saved["flow"].setdefault("jitter_angle", 1.0)
     changed = [
         key
         for key in IMMUTABLE_ON_RESUME
@@ -331,10 +347,18 @@ def load_config(argv: list[str] | None = None) -> tuple[Config, argparse.Namespa
     parser.add_argument("--n", type=int)
     parser.add_argument("--num-iters", type=int)
     parser.add_argument("--time", type=float)
-    parser.add_argument(
+    sampling = parser.add_mutually_exclusive_group()
+    sampling.add_argument(
         "-s",
         "--time-schedule",
         choices=("uniform", "exponential", "sine", "quadratic", "tail"),
+    )
+    sampling.add_argument(
+        "--jitter",
+        nargs="*",
+        type=float,
+        metavar="J",
+        help="Calibrated jitter: no values uses 1, one shares J, two set XY and angle",
     )
     parser.add_argument("--wandb-project")
     parser.add_argument("--wandb-name")
@@ -382,6 +406,13 @@ def load_config(argv: list[str] | None = None) -> tuple[Config, argparse.Namespa
     for (section, key), value in conveniences.items():
         if value is not None:
             merged[section][key] = value
+    if args.jitter is not None:
+        if len(args.jitter) > 2:
+            parser.error("--jitter accepts at most two values: XY [ANGLE]")
+        jitter = args.jitter or [1.0]
+        merged["flow"]["schedule"] = None
+        merged["flow"]["jitter_xy"] = jitter[0]
+        merged["flow"]["jitter_angle"] = jitter[-1]
     if args.num_tiles is not None:
         merged["spur"]["num_ret_tiles"] = args.num_tiles
     if args.resume:

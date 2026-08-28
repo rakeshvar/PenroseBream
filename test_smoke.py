@@ -31,9 +31,12 @@ from diffuser import (  # noqa: E402
     available_cpu_count,
     angle_delta,
     canonicalize_xya,
+    coordinate_flow_state,
+    draw_jitter_times,
     draw_time,
     endpoint_loss,
     flow_state,
+    jitter_lower_limits,
     periodic_pair_cost,
     schedule_time,
 )
@@ -53,6 +56,7 @@ from train import (  # noqa: E402
     one_batch_lookahead,
     validate_initialization_checkpoint,
 )
+from canvas import target_side_for_unit_var  # noqa: E402
 
 
 def smoke_values(symmetry: int, output: Path, epochs: int = 1) -> dict:
@@ -91,7 +95,7 @@ def check_config(root: Path) -> None:
     config = config_from_dict(smoke_values(5, root))
     assert batches_per_epoch(config) == 2
     fixed = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
-    assert make_identifier(config, fixed) == "bream8_0102_0304_16x1"
+    assert make_identifier(config, fixed) == "bream8_0102_0304_16x1_j1"
     variants = smoke_values(5, root)
     variants["flow"].update(matched=False, loss="l1", schedule="quadratic")
     assert make_identifier(config_from_dict(variants), fixed).endswith(
@@ -101,7 +105,9 @@ def check_config(root: Path) -> None:
         defaults = config_from_dict(yaml.safe_load(handle))
     assert defaults.model.d_model == 128
     assert defaults.model.num_layers == 8
-    assert defaults.flow.schedule == "exponential"
+    assert defaults.flow.schedule is None
+    assert defaults.flow.jitter_xy == 1.0
+    assert defaults.flow.jitter_angle == 1.0
     assert defaults.flow.r == 2 and defaults.flow.k == 8
     assert defaults.flow.tail_lim == 1.0 - 1.0 / 16.0
     assert defaults.flow.lsa_workers is None
@@ -115,6 +121,23 @@ def check_config(root: Path) -> None:
     assert overridden.flow.loss == "l1"
     tail_cli, _ = load_config(["-s", "tail"])
     assert tail_cli.flow.schedule == "tail"
+    jitter_default, _ = load_config(["--jitter"])
+    assert jitter_default.flow.schedule is None
+    assert jitter_default.flow.jitter_xy == 1.0
+    assert jitter_default.flow.jitter_angle == 1.0
+    jitter_shared, _ = load_config(["--jitter", "0.75"])
+    assert jitter_shared.flow.jitter_xy == 0.75
+    assert jitter_shared.flow.jitter_angle == 0.75
+    jitter_split, _ = load_config(["--jitter", "0.75", "0.5"])
+    assert jitter_split.flow.jitter_xy == 0.75
+    assert jitter_split.flow.jitter_angle == 0.5
+    try:
+        with redirect_stderr(io.StringIO()):
+            load_config(["--jitter", "--time-schedule", "tail"])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("CLI accepted jitter with a time schedule")
     tail_values = smoke_values(5, root)
     tail_values["flow"]["schedule"] = "tail"
     tail = config_from_dict(tail_values)
@@ -186,6 +209,35 @@ def check_schedules_and_geometry() -> None:
     assert tail_sampled.unique().numel() > 1
     assert bool((tail_sampled >= 0.9375).all())
 
+    report_cases = (
+        (5, 96, 0.929, 0.788),
+        (5, 384, 0.965, 0.788),
+        (6, 96, 0.912, 0.646),
+        (6, 384, 0.956, 0.646),
+    )
+    for symmetry, num_tiles, expected_xy, expected_angle in report_cases:
+        side = target_side_for_unit_var(symmetry, num_tiles)
+        lower_xy, lower_angle = jitter_lower_limits(symmetry, side, 1.0, 1.0)
+        assert abs(lower_xy - expected_xy) < 1e-3
+        assert abs(lower_angle - expected_angle) < 1e-3
+
+    jitter_generator = torch.Generator().manual_seed(29)
+    aggregate, time_xy, time_angle = draw_jitter_times(
+        32,
+        torch.device("cpu"),
+        torch.float32,
+        jitter_generator,
+        symmetry=5,
+        side=0.296,
+        jitter_xy=1.0,
+        jitter_angle=0.5,
+    )
+    lower_xy, lower_angle = jitter_lower_limits(5, 0.296, 1.0, 0.5)
+    unit_xy = (time_xy - lower_xy) / (1.0 - lower_xy)
+    unit_angle = (time_angle - lower_angle) / (1.0 - lower_angle)
+    assert torch.allclose(unit_xy, unit_angle, atol=1e-6)
+    assert torch.allclose(aggregate, (2.0 * time_xy + time_angle) / 3.0)
+
     noise = torch.tensor([[[0.0, 0.0, 1.70]]])
     data = torch.tensor([[[2.0, 4.0, -1.70]]])
     t0 = flow_state(noise, data, torch.tensor([0.0]))
@@ -195,6 +247,19 @@ def check_schedules_and_geometry() -> None:
     assert torch.allclose(t1, canonicalize_xya(data))
     assert abs(angle_delta(data[..., 2], noise[..., 2]).item()) < 0.1
     assert abs(midpoint[..., 2].item()) > 1.69
+    coordinate = coordinate_flow_state(
+        noise,
+        data,
+        torch.tensor([0.25]),
+        torch.tensor([0.75]),
+    )
+    assert torch.allclose(coordinate[..., :2], torch.tensor([[[0.5, 1.0]]]))
+    expected_angle = noise[..., 2] + 0.75 * angle_delta(
+        data[..., 2], noise[..., 2]
+    )
+    assert torch.allclose(coordinate[..., 2], canonicalize_xya(
+        torch.cat((coordinate[..., :2], expected_angle[..., None]), dim=-1)
+    )[..., 2])
 
     source = torch.tensor(
         [[[0.0, 0.0, -1.70], [5.0, 0.0, 1.70]]], dtype=torch.float32
@@ -354,10 +419,22 @@ def check_evaluator_and_svgs(root: Path) -> None:
     device = torch.device("cpu")
     spur = build_spur(config, device)
     matched = sample_flow_batch(
-        spur, config, 2, make_generator(device, 17), time=0.5, matched=True
+        spur,
+        config,
+        2,
+        make_generator(device, 17),
+        time=0.5,
+        schedule="uniform",
+        matched=True,
     )
     unmatched = sample_flow_batch(
-        spur, config, 2, make_generator(device, 17), time=0.5, matched=False
+        spur,
+        config,
+        2,
+        make_generator(device, 17),
+        time=0.5,
+        schedule="uniform",
+        matched=False,
     )
     assert torch.equal(matched.flow.data, unmatched.flow.data)
     assert torch.equal(matched.colors, unmatched.colors)
@@ -368,6 +445,19 @@ def check_evaluator_and_svgs(root: Path) -> None:
         unmatched.flow.data, unmatched.flow.noise
     ).diagonal(dim1=1, dim2=2).sum()
     assert matched_cost <= unmatched_cost
+
+    jitter_raw = sample_raw_flow_batch(
+        spur, config, 2, make_generator(device, 18)
+    )
+    assert jitter_raw.schedule is None
+    assert not torch.equal(jitter_raw.time_xy, jitter_raw.time_angle)
+    with GroupedLSAMatcher(1) as matcher:
+        jitter_pending = submit_evaluation_batch(
+            jitter_raw, config, matcher, matched=True
+        )
+        assert jitter_pending.flow.handle.task_count == 0
+        jitter_batch = jitter_pending.resolve()
+    assert torch.equal(jitter_batch.flow.noise, jitter_raw.noise)
 
     tail_values = smoke_values(6, root)
     tail_values["flow"]["schedule"] = "tail"
@@ -436,6 +526,10 @@ def check_evaluator_and_svgs(root: Path) -> None:
         parser.parse_args(["checkpoint.pt", "-s", "tail", "-o", "x"]).time_schedule
         == "tail"
     )
+    assert parser.parse_args(["checkpoint.pt", "--jitter", "-o", "x"]).jitter == []
+    assert parser.parse_args(
+        ["checkpoint.pt", "--jitter", "0.5", "0.25", "-o", "x"]
+    ).jitter == [0.5, 0.25]
 
 
 def check_retention(root: Path) -> None:
@@ -521,12 +615,17 @@ def check_fresh_process_resume(root: Path) -> None:
     first_path, first = newest_checkpoint(output)
     assert first["epoch"] == 0
     assert first["global_step"] == 2
-    assert first["flow"]["schedule"] == "exponential"
+    assert first["flow"]["schedule"] is None
+    assert first["flow"]["jitter_xy"] == 1.0
+    assert first["flow"]["jitter_angle"] == 1.0
+    assert 0.0 <= first["flow"]["jitter_lower_xy"] < 1.0
+    assert 0.0 <= first["flow"]["jitter_lower_angle"] < 1.0
     assert first["flow"]["tail_lim"] == 0.9375
-    assert first["flow"]["effective_matched"] is True
+    assert first["flow"]["effective_matched"] is False
     assert first["flow"]["match_time_threshold"] == MATCH_TIME_THRESHOLD
     assert first["flow"]["lsa_group_size"] == MAX_LSA_GROUP_SIZE
     assert first["identifier"].startswith("bream8_")
+    assert first["identifier"].endswith("_j1")
     svg_directory = Path(first["output_directory"]) / "svg"
     svg_050 = svg_directory / f"{first['identifier']}_e000_t050.svg"
     svg_095 = svg_directory / f"{first['identifier']}_e000_t095.svg"
@@ -604,6 +703,8 @@ def check_weight_transfer(root: Path) -> None:
         "target_num_tiles": 10,
         "target_schedule": "tail",
         "target_tail_lim": 0.97,
+        "target_jitter_xy": 1.0,
+        "target_jitter_angle": 1.0,
     }
     assert transferred["transfer_baseline"]["average_time"] >= 0.97
     assert transferred["config"]["train"]["learning_rate"] == 1e-4

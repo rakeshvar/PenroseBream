@@ -16,7 +16,9 @@ model:
 
 flow:
   matched: true
-  schedule: exponential
+  schedule: null
+  jitter_xy: 1.0
+  jitter_angle: 1.0
   r: 2.0
   k: 8.0
   tail_lim: 0.9375

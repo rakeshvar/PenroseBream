@@ -25,19 +25,31 @@ Chunk costs and SciPy LSA run in a persistent CPU thread pool. By default,
 `flow.lsa_workers=null` uses the available CPUs; set a positive integer to
 constrain it.
 
-For each training tiling, Bream independently draws `u ~ Uniform(0,1)`, maps it
-to `t`, and constructs:
+By default, Bream draws one `u ~ Uniform(0,1)` per tiling and maps it to
+separate spatial and angular times calibrated from target jitters:
 
 ```text
-xy_t = (1 - t) * xy_0 + t * xy_1
+tau_xy    = 1 - J_xy * sqrt(3) * delta * side / (4 * sqrt(2))
+tau_angle = 1 - 3 * J_angle / (10 * sqrt(2))  # Penrose
+tau_angle = 1 - J_angle / (2 * sqrt(2))       # hex
+t_xy      = tau_xy + (1 - tau_xy) * u
+t_angle   = tau_angle + (1 - tau_angle) * u
+xy_t = (1 - t_xy) * xy_0 + t_xy * xy_1
 delta_a = wrap(a_1 - a_0)
-a_t = wrap(a_0 + t * delta_a)
+a_t = wrap(a_0 + t_angle * delta_a)
 ```
+
+Here `delta` is the measured Penrose neighbour factor or `sqrt(3)` for hex.
+The default `J_xy=J_angle=1` follows the unit-jitter recommendation in
+`Experiments/noising_std_equivalence/bream_noising_jitter_report`.
+The calibrated path always uses unmatched endpoint noise, as assumed by the
+derivation.
 
 Scaled angle has period `2*sqrt(3)` and is canonicalized to
 `[-sqrt(3), sqrt(3))`. The model is not given `t`.
 
-Time schedules are:
+Legacy scalar-time schedules remain available explicitly through
+`--time-schedule`:
 
 ```text
 uniform:     t = u
@@ -47,7 +59,8 @@ quadratic:   t = 1 - (1 - u^2) = u^2
 tail:        t = tail_lim + (1 - tail_lim) * u      # default tail_lim=0.9375
 ```
 
-The `tail` schedule samples uniformly from `[tail_lim, 1]`. It always disables
+These schedules use the same scalar `t` for XY and angle. The `tail` schedule
+samples uniformly from `[tail_lim, 1]`. It always disables
 LSA matching, regardless of `flow.matched`, because it is intended for
 low-noise endpoint refinement.
 
@@ -76,16 +89,27 @@ Run through the workspace AIVE environment:
 ~/.aivenv/bin/python train.py
 ```
 
-The defaults are `d_model=128`, eight Transformer layers, matched LSA,
-exponential time, L2 endpoint loss, and approximately 140,000 fresh tilings per
-epoch. Examples:
+The defaults are `d_model=128`, eight Transformer layers, calibrated unit
+jitter, L2 endpoint loss, and approximately 140,000 fresh tilings per epoch.
+The jitter forms are:
+
+```bash
+~/.aivenv/bin/python train.py                 # J_xy=1, J_angle=1
+~/.aivenv/bin/python train.py --jitter        # explicit unit jitter
+~/.aivenv/bin/python train.py --jitter 0.75   # shared target
+~/.aivenv/bin/python train.py --jitter 0.75 0.5
+```
+
+One value applies to both coordinates; two set XY then angle. Lower limits are
+calculated automatically from symmetry, tile count, and PenroseSpur's actual
+side length. Existing schedules are selected explicitly:
 
 ```bash
 ~/.aivenv/bin/python train.py \
   -t batch_size=32 -t num_epochs=20 \
   -m d_model=128 -m num_layers=8 \
   -p symmetry=6 -p num_tiles=120 -p num_ret_tiles=120 \
-  -s sine -f loss=l1 --output outputs/hex
+  --time-schedule sine -f loss=l1 --output outputs/hex
 ```
 
 Unknown sections and keys are rejected. The resolved configuration prints
@@ -113,10 +137,11 @@ uploaded to WandB.
 Identifiers follow:
 
 ```text
-bream<num_tiles>_<MMDD>_<HHMM>_<d_model>x<num_layers>[_um][_l1][_<schedule>]
+bream<num_tiles>_<MMDD>_<HHMM>_<d_model>x<num_layers>[_um][_l1][_j<J>...|_<schedule>]
 ```
 
-Matched, L2, and exponential are defaults and therefore omit their suffixes.
+Jitter runs include their target(s), such as `_j1` or `_j0p75x0p5`.
+Matched, L2, and explicit exponential omit their legacy suffixes.
 The `tail` schedule appends only `_tail`; its automatic unmatched behavior does
 not add `_um`.
 
@@ -138,7 +163,10 @@ or a randomly drawn scheduled time:
 ~/.aivenv/bin/python evaluator.py CHECKPOINT -s tail -i 3 -n 8 -o evaluation
 ```
 
-`-t` and `-s` are mutually exclusive. With neither, exact `t=0` is used.
+Calibrated evaluation uses the checkpoint's jitter targets by default or
+overrides them with `--jitter`, `--jitter J`, or `--jitter J_XY J_ANGLE`.
+`-t`, `--time-schedule`, and `--jitter` are mutually exclusive. With none,
+the checkpoint's configured mode is used.
 `-u/--unmatched` evaluates unmatched noise. Other short flags are `-r` seed,
 `-y` symmetry, `-N` tile count, `-x` translation, and `-d` device.
 
@@ -176,7 +204,7 @@ output path, WandB run, global step, and all random states:
 ~/.aivenv/bin/python train.py --resume PATH/TO/CHECKPOINT.pt -t num_epochs=150
 ```
 
-Architecture, Spur geometry, matching, time schedule, and endpoint loss are
+Architecture, Spur geometry, matching, jitter/time schedule, and endpoint loss are
 immutable on resume. Legacy pre-flow checkpoints therefore cannot be resumed.
 
 For transfer learning, `--init-weights` strictly loads only model weights and
@@ -198,7 +226,8 @@ Before the first update, transfer runs print and store a target-task baseline.
 Each resulting checkpoint stores source provenance under `initialization` and
 the unchanged pre-update metrics under `transfer_baseline`.
 
-Scalar metrics include endpoint loss, XY loss, periodic angle loss, average
-time, average noise fraction, learning rate, gradient norm, and lattice losses
-at both epoch-evaluation times. WandB records scalars, config, and parameter
-counts but no SVG artifacts.
+Scalar metrics include endpoint loss, XY loss, periodic angle loss, separate
+average XY/angular times and noise fractions, their legacy aggregate, learning
+rate, gradient norm, and lattice losses at both epoch-evaluation times.
+Checkpoints also record jitter targets and derived lower limits. WandB records
+scalars, config, and parameter counts but no SVG artifacts.

@@ -20,6 +20,7 @@ from diffuser import (
     FlowBatch,
     GroupedLSAMatcher,
     PendingFlowBatch,
+    draw_jitter_times,
     draw_time,
     endpoint_loss,
     submit_flow_batch,
@@ -73,7 +74,9 @@ class RawEvaluationBatch:
     data: torch.Tensor
     noise: torch.Tensor
     time: torch.Tensor
-    schedule: str
+    time_xy: torch.Tensor
+    time_angle: torch.Tensor
+    schedule: str | None
     colors: torch.Tensor
     labels: torch.Tensor
 
@@ -130,8 +133,27 @@ def sample_raw_flow_batch(
     data = batch["xya"].float()
     colors = batch["colors"].long()
     noise = spur.sample_noise(batch_size, generator=generator).float()
-    selected_schedule = schedule or config.flow.schedule
-    if time is None:
+    selected_schedule = schedule if schedule is not None else config.flow.schedule
+    if time is not None:
+        if not 0.0 <= time <= 1.0:
+            raise ValueError("time must be in [0,1]")
+        times = torch.full(
+            (batch_size,), time, device=data.device, dtype=data.dtype
+        )
+        times_xy = times
+        times_angle = times
+    elif selected_schedule is None:
+        times, times_xy, times_angle = draw_jitter_times(
+            batch_size,
+            data.device,
+            data.dtype,
+            generator,
+            symmetry=config.spur.symmetry,
+            side=spur.side,
+            jitter_xy=config.flow.jitter_xy,
+            jitter_angle=config.flow.jitter_angle,
+        )
+    else:
         times = draw_time(
             batch_size,
             data.device,
@@ -142,16 +164,14 @@ def sample_raw_flow_batch(
             k=config.flow.k,
             tail_lim=config.flow.tail_lim,
         )
-    else:
-        if not 0.0 <= time <= 1.0:
-            raise ValueError("time must be in [0,1]")
-        times = torch.full(
-            (batch_size,), time, device=data.device, dtype=data.dtype
-        )
+        times_xy = times
+        times_angle = times
     return RawEvaluationBatch(
         data=data,
         noise=noise,
         time=times,
+        time_xy=times_xy,
+        time_angle=times_angle,
         schedule=selected_schedule,
         colors=colors,
         labels=batch["labels"].long(),
@@ -172,7 +192,9 @@ def submit_evaluation_batch(
         raw.colors,
         raw.time,
         matcher,
-        matched=requested_match and raw.schedule != "tail",
+        matched=requested_match and raw.schedule not in (None, "tail"),
+        time_xy=raw.time_xy,
+        time_angle=raw.time_angle,
     )
     return PendingEvaluationBatch(
         flow=pending,
@@ -306,6 +328,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--time-schedule",
         choices=("uniform", "exponential", "sine", "quadratic", "tail"),
     )
+    times.add_argument(
+        "--jitter",
+        nargs="*",
+        type=float,
+        metavar="J",
+        help="Calibrated jitter: no values uses 1, one shares J, two set XY and angle",
+    )
     parser.add_argument("-u", "--unmatched", action="store_true")
     parser.add_argument("-i", "--num-iters", type=int)
     parser.add_argument("-r", "--seed", type=int)
@@ -328,6 +357,15 @@ def main() -> None:
         values["spur"]["num_ret_tiles"] = args.num_tiles
     if args.translation is not None:
         values["spur"]["translation_canvas"] = args.translation
+    if args.time_schedule is not None:
+        values["flow"]["schedule"] = args.time_schedule
+    if args.jitter is not None:
+        if len(args.jitter) > 2:
+            raise ValueError("--jitter accepts at most two values: XY [ANGLE]")
+        jitter = args.jitter or [1.0]
+        values["flow"]["schedule"] = None
+        values["flow"]["jitter_xy"] = jitter[0]
+        values["flow"]["jitter_angle"] = jitter[-1]
     config = config_from_dict(values)
     device = choose_device(args.device)
     spur = build_spur(config, device)
@@ -347,11 +385,7 @@ def main() -> None:
                 config,
                 1,
                 generator,
-                time=(
-                    config.reverse.time
-                    if args.time is None and args.time_schedule is None
-                    else args.time
-                ),
+                time=args.time,
                 schedule=args.time_schedule,
                 matched=False if args.unmatched else None,
                 matcher=matcher,
@@ -374,7 +408,8 @@ def main() -> None:
                 terms = endpoint_loss(result, evaluation.flow.data, config.flow.loss)
                 print(
                     f"seed={sample_seed} iteration={iteration} "
-                    f"t={evaluation.flow.time.item():.6f} "
+                    f"t_xy={evaluation.flow.time_xy.item():.6f} "
+                    f"t_angle={evaluation.flow.time_angle.item():.6f} "
                     f"loss={terms.total.item():.6f}"
                 )
     print(f"Saved {count} paired evaluation sets to {args.output}")

@@ -39,10 +39,17 @@ class FlowBatch:
     data: torch.Tensor
     state: torch.Tensor
     time: torch.Tensor
+    time_xy: torch.Tensor
+    time_angle: torch.Tensor
 
 
 MATCH_TIME_THRESHOLD = 0.95
 MAX_LSA_GROUP_SIZE = 64
+PENROSE_NEIGHBOUR_FACTOR = (
+    0.24 * math.sin(math.pi / 5.0)
+    + 0.59 * math.sin(3.0 * math.pi / 10.0)
+    + 0.17 * math.sin(2.0 * math.pi / 5.0)
+)
 
 
 def available_cpu_count() -> int:
@@ -93,6 +100,88 @@ def draw_time(
 ) -> torch.Tensor:
     unit = torch.rand(batch_size, device=device, dtype=dtype, generator=generator)
     return schedule_time(unit, schedule, r=r, k=k, tail_lim=tail_lim)
+
+
+def jitter_lower_limits(
+    symmetry: int,
+    side: float,
+    jitter_xy: float,
+    jitter_angle: float,
+) -> tuple[float, float]:
+    """Return report-calibrated lower times for spatial and angular jitter."""
+    if symmetry == 5:
+        neighbour_factor = PENROSE_NEIGHBOUR_FACTOR
+        angle_noise = 3.0 * jitter_angle / (10.0 * math.sqrt(2.0))
+    elif symmetry == 6:
+        neighbour_factor = math.sqrt(3.0)
+        angle_noise = jitter_angle / (2.0 * math.sqrt(2.0))
+    else:
+        raise ValueError("symmetry must be 5 or 6")
+    if side <= 0 or jitter_xy <= 0 or jitter_angle <= 0:
+        raise ValueError("side and jitter targets must be positive")
+    xy_noise = (
+        jitter_xy
+        * math.sqrt(3.0)
+        * neighbour_factor
+        * side
+        / (4.0 * math.sqrt(2.0))
+    )
+    limits = (1.0 - xy_noise, 1.0 - angle_noise)
+    if any(limit < 0.0 or limit >= 1.0 for limit in limits):
+        raise ValueError(
+            "jitter targets produce lower times outside [0,1): "
+            f"xy={limits[0]:.6g}, angle={limits[1]:.6g}"
+        )
+    return limits
+
+
+def draw_jitter_times(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    *,
+    symmetry: int,
+    side: float,
+    jitter_xy: float,
+    jitter_angle: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Draw one shared unit time and map it to coordinate-specific tails."""
+    lower_xy, lower_angle = jitter_lower_limits(
+        symmetry, side, jitter_xy, jitter_angle
+    )
+    unit = torch.rand(batch_size, device=device, dtype=dtype, generator=generator)
+    time_xy = lower_xy + (1.0 - lower_xy) * unit
+    time_angle = lower_angle + (1.0 - lower_angle) * unit
+    aggregate = (2.0 * time_xy + time_angle) / 3.0
+    return aggregate, time_xy, time_angle
+
+
+def coordinate_flow_state(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    time_xy: torch.Tensor,
+    time_angle: torch.Tensor,
+) -> torch.Tensor:
+    """Interpolate XY and periodic angle at independent per-sample times."""
+    if source.shape != target.shape or source.ndim != 3 or source.shape[-1] != 3:
+        raise ValueError("source and target must share shape (B,N,3)")
+    expected = (source.shape[0],)
+    if time_xy.shape != expected or time_angle.shape != expected:
+        raise ValueError(f"coordinate times must each have shape {expected}")
+    if bool(
+        ((time_xy < 0) | (time_xy > 1) | (time_angle < 0) | (time_angle > 1)).any()
+    ):
+        raise ValueError("coordinate times must lie in [0,1]")
+    xy_amount = time_xy.to(device=source.device, dtype=source.dtype)[:, None, None]
+    angle_amount = time_angle.to(
+        device=source.device, dtype=source.dtype
+    )[:, None]
+    xy = source[..., :2] + xy_amount * (target[..., :2] - source[..., :2])
+    angle = wrap_angle(
+        source[..., 2] + angle_amount * angle_delta(target[..., 2], source[..., 2])
+    )
+    return torch.cat((xy, angle[..., None]), dim=-1)
 
 
 def periodic_pair_cost(data: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
@@ -223,6 +312,8 @@ class PendingFlowBatch:
     data: torch.Tensor
     noise: torch.Tensor
     time: torch.Tensor
+    time_xy: torch.Tensor
+    time_angle: torch.Tensor
     handle: MatchHandle
 
     def resolve(self) -> FlowBatch:
@@ -233,8 +324,12 @@ class PendingFlowBatch:
         return FlowBatch(
             noise=ordered_noise,
             data=self.data,
-            state=flow_state(ordered_noise, self.data, self.time),
+            state=coordinate_flow_state(
+                ordered_noise, self.data, self.time_xy, self.time_angle
+            ),
             time=self.time,
+            time_xy=self.time_xy,
+            time_angle=self.time_angle,
         )
 
 
@@ -246,9 +341,18 @@ def submit_flow_batch(
     matcher: GroupedLSAMatcher,
     *,
     matched: bool,
+    time_xy: torch.Tensor | None = None,
+    time_angle: torch.Tensor | None = None,
 ) -> PendingFlowBatch:
     handle = matcher.submit(data, noise, colors, time, matched=matched)
-    return PendingFlowBatch(data=data, noise=noise, time=time, handle=handle)
+    return PendingFlowBatch(
+        data=data,
+        noise=noise,
+        time=time,
+        time_xy=time if time_xy is None else time_xy,
+        time_angle=time if time_angle is None else time_angle,
+        handle=handle,
+    )
 
 
 def endpoint_loss(prediction: torch.Tensor, target: torch.Tensor, loss: str) -> LossTerms:
