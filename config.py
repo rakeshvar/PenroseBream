@@ -265,7 +265,7 @@ def validate(config: Config) -> None:
 def effective_translation(config: SpurConfig) -> float:
     if config.translation_canvas is not None:
         return float(config.translation_canvas)
-    return math.sqrt(config.num_tiles) if config.symmetry == 5 else 2.0
+    return 2.0
 
 
 def batches_per_epoch(config: Config) -> int:
